@@ -1,0 +1,8 @@
+{
+  "name": "CAD/office助手",
+  "description": "AutoCAD AutoLISP 与 Microsoft Office / WPS VBA 宏代码智能生成和本地运行助手。AI 驱动的跨平台高效自动化交互开发工具。",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
