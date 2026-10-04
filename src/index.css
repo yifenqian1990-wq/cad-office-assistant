@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .markdown-body {
+    @apply text-gray-700;
+  }
+  .markdown-body p {
+    @apply mb-4 leading-relaxed;
+  }
+  .markdown-body code:not(pre code) {
+    @apply bg-gray-200/50 text-gray-800 px-1.5 py-0.5 rounded text-sm font-mono;
+  }
+}
