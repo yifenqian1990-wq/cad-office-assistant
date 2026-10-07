@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import { AppSettings, ApiKey } from '../hooks/useSettings';
 import { GoogleGenAI } from '@google/genai';
 import { 
   X, Plus, Trash2, Edit2, Check, Key, RefreshCw, FolderOpen, 
-  Sparkles, CheckCircle2, AlertCircle, Loader2, Bot, Server
+  Sparkles, CheckCircle2, AlertCircle, Loader2, Bot, Server,
+  Download, Upload, FileJson, Unlink, HardDrive
 } from 'lucide-react';
 
 interface SettingsModalProps {
@@ -48,7 +49,92 @@ export function SettingsModal({ isOpen, onClose, settings, onSave, chatHistory }
     message: string;
   }>({ provider: null, type: null, message: '' });
 
+  // Chat history persistent sync state
+  const [syncOperationMsg, setSyncOperationMsg] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const [syncLoadingAction, setSyncLoadingAction] = useState<'import' | 'export' | 'manual' | null>(null);
+  const fallbackFileInputRef = useRef<HTMLInputElement>(null);
+
   if (!isOpen) return null;
+
+  const handleExportChat = async () => {
+    setSyncLoadingAction('export');
+    try {
+      const res = typeof chatHistory.exportChatFile === 'function'
+        ? await chatHistory.exportChatFile()
+        : await chatHistory.setupFileConnection();
+      if (res && res.success) {
+        setSyncOperationMsg({ type: 'success', text: res.message || '导出成功并已建立持久同步！' });
+      } else if (res && res.message && !res.message.includes('取消')) {
+        setSyncOperationMsg({ type: 'error', text: res.message });
+      }
+    } catch (err: any) {
+      setSyncOperationMsg({ type: 'error', text: err?.message || '导出聊天文件失败' });
+    } finally {
+      setSyncLoadingAction(null);
+    }
+  };
+
+  const handleImportChat = async () => {
+    setSyncLoadingAction('import');
+    try {
+      if ('showOpenFilePicker' in window && typeof chatHistory.importChatFile === 'function') {
+        const res = await chatHistory.importChatFile();
+        if (res && res.success) {
+          setSyncOperationMsg({ type: 'success', text: res.message || '导入成功并已建立持久同步！' });
+        } else if (res && res.message && !res.message.includes('取消')) {
+          setSyncOperationMsg({ type: 'error', text: res.message });
+        }
+      } else {
+        // Fallback to file picker input
+        fallbackFileInputRef.current?.click();
+      }
+    } catch (err: any) {
+      setSyncOperationMsg({ type: 'error', text: err?.message || '导入聊天文件失败' });
+    } finally {
+      setSyncLoadingAction(null);
+    }
+  };
+
+  const handleFallbackFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setSyncLoadingAction('import');
+    try {
+      if (typeof chatHistory.importChatFile === 'function') {
+        const res = await chatHistory.importChatFile(file);
+        if (res && res.success) {
+          setSyncOperationMsg({ type: 'success', text: res.message || '导入成功！' });
+        } else if (res && res.message) {
+          setSyncOperationMsg({ type: 'error', text: res.message });
+        }
+      }
+    } catch (err: any) {
+      setSyncOperationMsg({ type: 'error', text: err?.message || '导入失败' });
+    } finally {
+      setSyncLoadingAction(null);
+      e.target.value = '';
+    }
+  };
+
+  const handleDisconnectSync = async () => {
+    if (window.confirm('确定要解除与当前本地文件的同步关联吗？\n（解除后历史记录仍保留在当前浏览器中，但不再向该文件自动写入）')) {
+      if (typeof chatHistory.disconnectFile === 'function') {
+        await chatHistory.disconnectFile();
+      }
+      setSyncOperationMsg({ type: 'info', text: '已解除文件同步关联，历史记录目前仅保存在当前浏览器存储中。' });
+    }
+  };
+
+  const handleManualSync = async () => {
+    setSyncLoadingAction('manual');
+    try {
+      if (typeof chatHistory.manualSync === 'function') {
+        await chatHistory.manualSync();
+      }
+    } finally {
+      setSyncLoadingAction(null);
+    }
+  };
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     const { name, value } = e.target;
@@ -1092,36 +1178,97 @@ export function SettingsModal({ isOpen, onClose, settings, onSave, chatHistory }
           </div>
 
           {/* Local File Storage for Chat History */}
-          <div className="space-y-4 pt-4 border-t border-gray-100">
+          <div className="space-y-3 pt-4 border-t border-gray-100">
             <div className="flex items-center justify-between">
-              <h3 className="text-xs font-semibold text-gray-700 uppercase tracking-wider">聊天历史文件同步</h3>
-              <span className="text-[10px] text-gray-400 bg-gray-100 px-2 py-0.5 rounded">实时同步</span>
+              <div className="flex items-center gap-1.5">
+                <HardDrive size={14} className="text-blue-600" />
+                <h3 className="text-xs font-semibold text-gray-800 uppercase tracking-wider">聊天历史文件导入与导出同步</h3>
+              </div>
+              {chatHistory.fileHandleName && !chatHistory.handleNeedsPermission ? (
+                <span className="text-[10px] text-green-700 bg-green-50 border border-green-200 px-2 py-0.5 rounded-full flex items-center gap-1 font-medium">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                  持续热同步中
+                </span>
+              ) : chatHistory.handleNeedsPermission ? (
+                <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full flex items-center gap-1 font-medium">
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
+                  需恢复授权
+                </span>
+              ) : (
+                <span className="text-[10px] text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full font-medium">
+                  浏览器本地存储
+                </span>
+              )}
             </div>
-            <div className="bg-gray-50 rounded-xl p-3 border border-gray-200 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <div className={`w-2 h-2 rounded-full ${chatHistory.fileHandleName ? (chatHistory.handleNeedsPermission ? 'bg-yellow-400' : 'bg-green-500') : 'bg-gray-300'}`} />
-                  <span className="text-xs text-gray-700">
-                    {chatHistory.fileHandleName ? (
-                      <span className="font-medium" title={chatHistory.fileHandleName}>
-                        {chatHistory.fileHandleName.length > 25 ? chatHistory.fileHandleName.slice(0, 25) + '...' : chatHistory.fileHandleName}
+
+            <p className="text-[11px] text-gray-500 leading-relaxed">
+              支持通过<strong>导入</strong>已有历史文件或<strong>导出</strong>当前记录关联本地 JSON 文件。不管是导入还是导出，系统均会持久保持热连接；后续所有对话、修改或删除都会<strong>自动实时双向同步</strong>至该文件。
+            </p>
+
+            <div className="bg-gray-50 rounded-xl p-3.5 border border-gray-200 space-y-3">
+              {/* Current file connection status */}
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className={`p-2 rounded-lg flex-shrink-0 ${
+                    chatHistory.fileHandleName 
+                      ? chatHistory.handleNeedsPermission 
+                        ? 'bg-amber-100 text-amber-700' 
+                        : 'bg-green-100 text-green-700' 
+                      : 'bg-gray-200 text-gray-500'
+                  }`}>
+                    <FileJson size={16} />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-xs font-semibold text-gray-900 truncate max-w-[200px]" title={chatHistory.fileHandleName || '未关联同步文件'}>
+                        {chatHistory.fileHandleName || '未关联同步文件'}
                       </span>
-                    ) : '未设置保存文件'}
-                  </span>
+                    </div>
+                    <div className="text-[11px] text-gray-500 flex items-center gap-2">
+                      <span>当前会话: {chatHistory.sessions?.length || 0} 个</span>
+                      {chatHistory.lastSyncTime && (
+                        <>
+                          <span>•</span>
+                          <span>上次同步: {new Date(chatHistory.lastSyncTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+                        </>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                {chatHistory.fileHandleName && !chatHistory.handleNeedsPermission && (
-                  <span className="text-xs text-green-600 flex items-center gap-1">
-                    <Check size={12} /> 已同步
-                  </span>
+
+                {chatHistory.fileHandleName && (
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <button
+                      type="button"
+                      onClick={handleManualSync}
+                      disabled={syncLoadingAction !== null}
+                      title="立即将当前数据写入文件"
+                      className="p-1.5 text-xs text-gray-600 hover:text-blue-600 hover:bg-white rounded-lg border border-transparent hover:border-gray-200 transition-colors flex items-center gap-1"
+                    >
+                      <RefreshCw size={13} className={syncLoadingAction === 'manual' ? 'animate-spin text-blue-600' : ''} />
+                      <span className="text-[11px]">立即保存</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDisconnectSync}
+                      title="解除与此本地文件的关联"
+                      className="p-1.5 text-xs text-gray-400 hover:text-red-600 hover:bg-white rounded-lg border border-transparent hover:border-gray-200 transition-colors flex items-center gap-1"
+                    >
+                      <Unlink size={13} />
+                      <span className="text-[11px]">解除</span>
+                    </button>
+                  </div>
                 )}
               </div>
-              
+
+              {/* Permission reconnect notice */}
               {chatHistory.handleNeedsPermission && (
-                <div className="bg-yellow-50 text-yellow-800 text-xs p-2 rounded-lg border border-yellow-200 flex items-center justify-between">
-                  <span>需要重新授权文件读写权限</span>
+                <div className="bg-amber-50 text-amber-800 text-xs p-2.5 rounded-lg border border-amber-200 flex items-center justify-between gap-2">
+                  <span className="leading-snug">需要重新授予对该文件的读写权限以恢复同步</span>
                   <button 
+                    type="button"
                     onClick={chatHistory.reconnectFile}
-                    className="flex items-center gap-1 bg-white px-2 py-1 rounded shadow-sm hover:bg-gray-50 transition-colors whitespace-nowrap ml-2 text-xs"
+                    className="flex items-center gap-1 bg-white border border-amber-300 text-amber-900 px-2.5 py-1 rounded shadow-sm hover:bg-amber-100 transition-colors whitespace-nowrap text-xs font-medium"
                   >
                     <RefreshCw size={12} />
                     <span>恢复连接</span>
@@ -1129,13 +1276,84 @@ export function SettingsModal({ isOpen, onClose, settings, onSave, chatHistory }
                 </div>
               )}
 
-              <button
-                onClick={chatHistory.setupFileConnection}
-                className="w-full flex items-center justify-center gap-2 py-1.5 px-3 bg-white border border-gray-300 text-gray-700 rounded-lg text-xs hover:bg-gray-50 transition-colors shadow-sm"
-              >
-                <FolderOpen size={14} />
-                {chatHistory.fileHandleName ? '更改同步文件位置' : '选择同步文件位置 (支持跨设备/重置防丢)'}
-              </button>
+              {/* Action buttons: Import & Export both establish and maintain persistent sync */}
+              <div className="grid grid-cols-2 gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={handleImportChat}
+                  disabled={syncLoadingAction !== null}
+                  className="flex flex-col items-center justify-center gap-1.5 py-2.5 px-3 bg-white hover:bg-blue-50/70 border border-gray-200 hover:border-blue-300 text-gray-800 hover:text-blue-700 rounded-xl text-xs font-medium transition-all shadow-sm group"
+                >
+                  <div className="flex items-center gap-1.5 font-semibold text-blue-600">
+                    {syncLoadingAction === 'import' ? (
+                      <Loader2 size={14} className="animate-spin text-blue-600" />
+                    ) : (
+                      <Download size={14} className="group-hover:-translate-y-0.5 transition-transform" />
+                    )}
+                    <span>导入聊天历史</span>
+                  </div>
+                  <span className="text-[10px] text-gray-500 text-center font-normal">
+                    载入文件并建立持久同步
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExportChat}
+                  disabled={syncLoadingAction !== null}
+                  className="flex flex-col items-center justify-center gap-1.5 py-2.5 px-3 bg-white hover:bg-blue-50/70 border border-gray-200 hover:border-blue-300 text-gray-800 hover:text-blue-700 rounded-xl text-xs font-medium transition-all shadow-sm group"
+                >
+                  <div className="flex items-center gap-1.5 font-semibold text-blue-600">
+                    {syncLoadingAction === 'export' ? (
+                      <Loader2 size={14} className="animate-spin text-blue-600" />
+                    ) : (
+                      <Upload size={14} className="group-hover:-translate-y-0.5 transition-transform" />
+                    )}
+                    <span>导出聊天历史</span>
+                  </div>
+                  <span className="text-[10px] text-gray-500 text-center font-normal">
+                    另存文件并建立持久同步
+                  </span>
+                </button>
+              </div>
+
+              {/* Hidden fallback file input */}
+              <input
+                type="file"
+                ref={fallbackFileInputRef}
+                accept=".json"
+                className="hidden"
+                onChange={handleFallbackFileChange}
+              />
+
+              {/* Feedback alert message */}
+              {syncOperationMsg && (
+                <div className={`p-2.5 rounded-lg text-xs flex items-start gap-2 ${
+                  syncOperationMsg.type === 'success' 
+                    ? 'bg-green-50 text-green-800 border border-green-200' 
+                    : syncOperationMsg.type === 'error'
+                    ? 'bg-red-50 text-red-800 border border-red-200'
+                    : 'bg-blue-50 text-blue-800 border border-blue-200'
+                }`}>
+                  {syncOperationMsg.type === 'success' ? (
+                    <CheckCircle2 size={15} className="text-green-600 flex-shrink-0 mt-0.5" />
+                  ) : syncOperationMsg.type === 'error' ? (
+                    <AlertCircle size={15} className="text-red-600 flex-shrink-0 mt-0.5" />
+                  ) : (
+                    <Sparkles size={15} className="text-blue-600 flex-shrink-0 mt-0.5" />
+                  )}
+                  <div className="flex-1 leading-snug">
+                    {syncOperationMsg.text}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSyncOperationMsg(null)}
+                    className="text-gray-400 hover:text-gray-600 text-[10px] ml-1"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
