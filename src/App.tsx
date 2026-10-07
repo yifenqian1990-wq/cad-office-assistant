@@ -296,12 +296,12 @@ export default function App() {
       const res = await generateResponse(
         currentMessages,
         settings,
-        (chunk) => {
+        (chunk, reset) => {
           if (abortController.signal.aborted) return;
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === assistantMessageId
-                ? { ...msg, content: msg.content + chunk }
+                ? { ...msg, content: reset ? chunk : msg.content + chunk }
                 : msg
             )
           );
@@ -1284,11 +1284,32 @@ export default function App() {
           )}
 
           {error && (
-            <div className="flex items-start gap-3 p-4 bg-red-50 border border-red-200 rounded-xl text-red-700 text-sm mx-auto max-w-2xl shadow-sm">
-              <AlertCircle size={18} className="flex-none mt-0.5 text-red-500" />
-              <div className="flex-1 space-y-1">
-                <p className="leading-relaxed font-medium">{error}</p>
-                <div className="flex flex-wrap items-center gap-3 pt-1 text-xs">
+            <div className={`flex items-start gap-3 p-4 rounded-xl text-sm mx-auto max-w-2xl shadow-sm ${
+              error.includes('高峰') || error.includes('繁忙')
+                ? 'bg-amber-50/95 border border-amber-300 text-amber-950'
+                : 'bg-red-50 border border-red-200 text-red-700'
+            }`}>
+              <AlertCircle size={18} className={`flex-none mt-0.5 ${
+                error.includes('高峰') || error.includes('繁忙') ? 'text-amber-600' : 'text-red-500'
+              }`} />
+              <div className="flex-1 space-y-2">
+                <p className="leading-relaxed font-medium whitespace-pre-line">{error}</p>
+                <div className="flex flex-wrap items-center gap-2 pt-1 text-xs">
+                  {(error.includes('高峰') || error.includes('繁忙')) && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setError(null);
+                        if (messagesRef.current.length > 0 && !isGenerating) {
+                          runAI(messagesRef.current);
+                        }
+                      }}
+                      className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-md font-medium transition-colors shadow-xs flex items-center gap-1 cursor-pointer"
+                    >
+                      <RefreshCw size={12} />
+                      重试当前请求
+                    </button>
+                  )}
                   {(error.includes('Office') || error.includes('Word') || error.includes('COM') || error.includes('代理') || error.includes('CAD')) && (
                     <button
                       type="button"
@@ -1301,9 +1322,9 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setIsSettingsOpen(true)}
-                    className="text-gray-500 hover:text-gray-700 underline"
+                    className="text-gray-600 hover:text-gray-900 font-medium underline"
                   >
-                    API 配置
+                    切换模型 / API 配置
                   </button>
                   <button
                     type="button"

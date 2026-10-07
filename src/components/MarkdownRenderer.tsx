@@ -358,6 +358,45 @@ function CodeBlock({
   );
 }
 
+function ThinkingSection({ thinkText, isStreaming }: { thinkText: string; isStreaming: boolean }) {
+  const [isExpanded, setIsExpanded] = useState(isStreaming);
+
+  React.useEffect(() => {
+    if (isStreaming) {
+      setIsExpanded(true);
+    }
+  }, [isStreaming]);
+
+  if (!thinkText.trim()) return null;
+
+  return (
+    <div className="mb-3.5 rounded-xl border border-purple-200/80 bg-purple-50/40 overflow-hidden text-xs text-gray-700 transition-all shadow-sm">
+      <button
+        type="button"
+        onClick={() => setIsExpanded(!isExpanded)}
+        className="w-full flex items-center justify-between px-3.5 py-2 text-purple-700 bg-purple-100/60 hover:bg-purple-100 font-medium transition-colors cursor-pointer select-none"
+      >
+        <span className="flex items-center gap-1.5">
+          <Sparkles size={13} className="text-purple-600 animate-pulse" />
+          <span>{isStreaming ? '正在深度推理思考中...' : '已完成深度思考'}</span>
+        </span>
+        <span className="flex items-center gap-1 text-[11px] text-purple-600 font-normal">
+          <span>{isExpanded ? '收起思考' : '展开查看思考过程'}</span>
+          {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        </span>
+      </button>
+      {isExpanded && (
+        <div className="p-3.5 border-t border-purple-200/60 text-gray-600 leading-relaxed font-mono text-[11.5px] whitespace-pre-wrap max-h-72 overflow-y-auto bg-white/70">
+          {thinkText}
+          {isStreaming && (
+            <span className="inline-block w-1.5 h-3.5 ml-1 bg-purple-500 animate-pulse align-middle" />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function MarkdownRenderer({ 
   content, 
   onSendToCad, 
@@ -380,9 +419,12 @@ export function MarkdownRenderer({
   const callbacksRef = React.useRef({ onSendToCad, onSendToOffice, onBookmark, onQuickPrompt });
   callbacksRef.current = { onSendToCad, onSendToOffice, onBookmark, onQuickPrompt };
 
-  // Clean think blocks if any existed in raw string
+  // Extract thinking process if present (DeepSeek R1 / Gemini Thinking)
+  let thinkText = '';
   let sanitizedMarkdown = content || '';
-  if (sanitizedMarkdown.includes('<think>')) {
+  const thinkMatch = sanitizedMarkdown.match(/<think>([\s\S]*?)(?:<\/think>|$)/i);
+  if (thinkMatch) {
+    thinkText = thinkMatch[1].trim();
     sanitizedMarkdown = sanitizedMarkdown.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
   }
 
@@ -417,6 +459,12 @@ export function MarkdownRenderer({
 
   return (
     <div className="w-full">
+      {thinkText && (
+        <ThinkingSection 
+          thinkText={thinkText} 
+          isStreaming={Boolean(isGenerating && !content.includes('</think>'))} 
+        />
+      )}
       {sanitizedMarkdown ? (
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
@@ -427,7 +475,12 @@ export function MarkdownRenderer({
       ) : isGenerating ? (
         <div className="text-xs text-gray-500 italic py-2 flex items-center gap-1.5">
           <Loader2 size={13} className="animate-spin text-blue-600" />
-          <span>AI 正在生成代码与回复...</span>
+          <span>{thinkText ? '思考推理已完成，正在生成正式回复与代码...' : 'AI 正在生成代码与回复...'}</span>
+        </div>
+      ) : thinkText ? (
+        <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2.5 flex items-center gap-2 mt-2">
+          <AlertCircle size={14} className="flex-none text-amber-600" />
+          <span>模型完成了深度思考推理，但在生成正式答复前请求被服务高峰（如 503）中断。上方已为您完整保留思考过程。</span>
         </div>
       ) : (
         <div className="text-xs text-gray-400 italic py-1 flex items-center gap-1.5">
