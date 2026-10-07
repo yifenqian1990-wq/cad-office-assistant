@@ -14,6 +14,162 @@ export interface ChatMessage {
 
 export type InteractionMode = 'CODE' | 'SKILL';
 
+export type StreamCallback = (chunk: string, reset?: boolean) => void;
+
+export function parseApiError(error: any): { 
+  code?: number | string; 
+  status?: string; 
+  message: string; 
+  raw: string 
+} {
+  if (!error) return { message: '未知错误', raw: '' };
+  
+  const rawStr = typeof error === 'string' 
+    ? error 
+    : (error.message || error.statusText || String(error));
+  
+  let extractedCode: number | string | undefined = error.code || error.status;
+  let extractedStatus: string | undefined = error.status;
+  let extractedMessage = rawStr;
+
+  if (typeof error === 'object' && error !== null) {
+    if (error.error?.message) {
+      extractedMessage = error.error.message;
+      if (error.error.code) extractedCode = error.error.code;
+      if (error.error.status) extractedStatus = error.error.status;
+    }
+  }
+
+  const startIdx = rawStr.indexOf('{');
+  const endIdx = rawStr.lastIndexOf('}');
+  if (startIdx !== -1 && endIdx > startIdx) {
+    try {
+      const jsonCandidate = rawStr.substring(startIdx, endIdx + 1);
+      const parsed = JSON.parse(jsonCandidate);
+      if (parsed.error?.message) {
+        extractedMessage = parsed.error.message;
+        if (parsed.error.code) extractedCode = parsed.error.code;
+        if (parsed.error.status) extractedStatus = parsed.error.status;
+      } else if (parsed.message) {
+        extractedMessage = parsed.message;
+      }
+    } catch {
+      // not valid JSON
+    }
+  }
+
+  extractedMessage = extractedMessage.replace(/^\[GoogleGenAI\s+Error\]:\s*/i, '').trim();
+
+  let formatted = extractedMessage;
+  if (extractedStatus && !formatted.includes(extractedStatus)) {
+    formatted = `${extractedStatus}: ${formatted}`;
+  } else if (extractedCode && !formatted.includes(String(extractedCode))) {
+    formatted = `${extractedCode}: ${formatted}`;
+  }
+
+  return {
+    code: extractedCode,
+    status: extractedStatus,
+    message: formatted,
+    raw: rawStr
+  };
+}
+
+export interface ServerBusyCheckResult {
+  isBusy: boolean;
+  reason: string;
+}
+
+/**
+ * 判断错误是否由服务商高峰期算力繁忙/过载导致。
+ * 如果是高峰期繁忙中断，则停止密钥轮换并给出明确的中断原因与建议。
+ */
+export function checkServerBusyError(error: any, provider: 'Gemini' | 'DeepSeek' | 'OpenAI' = 'Gemini'): ServerBusyCheckResult {
+  if (!error) return { isBusy: false, reason: '' };
+
+  const parsed = parseApiError(error);
+  const code = String(parsed.code || error?.status || error?.code || '');
+  const status = String(parsed.status || error?.status || '').toUpperCase();
+  const rawCombined = `${parsed.raw} ${parsed.message} ${String(error?.message || '')} ${String(error?.statusText || '')}`.toLowerCase();
+
+  // 1. 状态码与状态标识检查：503 (UNAVAILABLE / Service Unavailable), 529 (Site Overloaded), 504/502 (高峰网关超时或错误)
+  const is503 = code === '503' || status.includes('503') || status.includes('UNAVAILABLE') || rawCombined.includes('503') || rawCombined.includes('unavailable');
+  const is529 = code === '529' || status.includes('529') || rawCombined.includes('529');
+  const is504 = code === '504' || status.includes('504') || rawCombined.includes('504');
+  const is502 = code === '502' || status.includes('502') || rawCombined.includes('502');
+
+  // 2. 关键词检查（中英文典型高峰期/高负载/繁忙错误提示）
+  const busyKeywords = [
+    'overloaded',
+    'high demand',
+    'server is busy',
+    'server busy',
+    'server_busy',
+    'temporarily unavailable',
+    'service unavailable',
+    'service_unavailable',
+    'capacity exceeded',
+    'exceeded capacity',
+    'model capacity',
+    'high traffic',
+    'traffic limit exceeded',
+    'site is overloaded',
+    'upstream request timeout',
+    'upstream connect error',
+    'gateway timeout',
+    '服务器繁忙',
+    '系统繁忙',
+    '服务繁忙',
+    '负载过高',
+    '高峰期',
+    '高峰时段',
+    '高峰时刻',
+    '服务暂时不可用',
+    '服务不可用',
+    '算力不足',
+    '资源暂时耗尽，请稍后再试'
+  ];
+
+  const matchedKeyword = busyKeywords.find(kw => rawCombined.includes(kw.toLowerCase()));
+
+  // 排除单纯由用户主动取消产生的中断
+  const isUserAbort = rawCombined.includes('abort') || rawCombined.includes('cancelled');
+  if (isUserAbort && !is503 && !is529 && !matchedKeyword) {
+    return { isBusy: false, reason: '' };
+  }
+
+  if (is503 || is529 || is504 || is502 || matchedKeyword) {
+    let specificDetail = '';
+    if (rawCombined.includes('overloaded') || rawCombined.includes('负载过高')) {
+      specificDetail = '官方模型算力负载过高（Model Overloaded）';
+    } else if (rawCombined.includes('high demand') || rawCombined.includes('high traffic') || rawCombined.includes('高峰')) {
+      specificDetail = '正处于使用高峰期，官方服务器并发请求超负荷（High Demand / Traffic）';
+    } else if (rawCombined.includes('server is busy') || rawCombined.includes('server_busy') || rawCombined.includes('服务器繁忙') || rawCombined.includes('系统繁忙')) {
+      specificDetail = '官方服务节点繁忙（Server Busy）';
+    } else if (is529 || rawCombined.includes('site is overloaded')) {
+      specificDetail = '站点过载（529 Site Overloaded）';
+    } else if (is504 || rawCombined.includes('timeout')) {
+      specificDetail = '服务器网关响应超时（504 Gateway Timeout）';
+    } else if (is503 || status.includes('UNAVAILABLE') || rawCombined.includes('unavailable')) {
+      specificDetail = '官方服务暂时不可用（503 Service Unavailable / UNAVAILABLE）';
+    } else {
+      specificDetail = '服务高峰期高负载';
+    }
+
+    const providerName = provider === 'Gemini' ? 'Google Gemini' : (provider === 'DeepSeek' ? 'DeepSeek' : 'OpenAI');
+    const cleanErrorSnippet = parsed.message ? `\n📌 服务端返回：${parsed.message}` : '';
+
+    const reason = `【${providerName} 高峰期繁忙 · 生成中断】\n⚠️ 中断原因：${specificDetail}。\n此时段属于官方云端服务请求高峰，服务器并发负载已满。此问题属于服务商机房算力承载上限，并非您的 API 密钥失效或个人额度用尽。因此系统已直接停止生成，未进行密钥轮换。\n💡 建议操作：\n1. 请稍候 1~2 分钟待高峰流量缓解后重试。\n2. 或在【设置 - API配置】中切换为其他轻量或备用模型（如 gemini-2.5-flash / deepseek-chat）。${cleanErrorSnippet}`;
+
+    return {
+      isBusy: true,
+      reason
+    };
+  }
+
+  return { isBusy: false, reason: '' };
+}
+
 const BASE_GUIDELINES = `
 IMPORTANT GUIDELINES:
 1. Wrap all AutoLISP code in a \`\`\`lisp ... \`\`\` block.
@@ -51,7 +207,7 @@ Ask the user if the result matches their expectations. If logic is successful, s
 export async function generateResponse(
   messages: ChatMessage[],
   settings: AppSettings,
-  onStream: (chunk: string) => void,
+  onStream: StreamCallback,
   executeCode?: (code: string) => Promise<string | boolean>,
   mode: InteractionMode = 'CODE',
   module: 'CAD' | 'OFFICE' = 'CAD',
@@ -100,18 +256,24 @@ Your capabilities cover two main categories:
   }
   let fullResponse = '';
 
-  const handleStreamChunk = (chunk: string) => {
-    fullResponse += chunk;
-    onStream(chunk);
+  const handleStreamChunk = (chunk: string, reset?: boolean) => {
+    if (reset) {
+      fullResponse = chunk;
+    } else {
+      fullResponse += chunk;
+    }
+    onStream(chunk, reset);
   };
 
   if (activeProvider === 'gemini') {
-    if (!settings.geminiKeys || settings.geminiKeys.length === 0) {
-      if (settings.geminiKey) {
-        settings.geminiKeys = [{ id: 'default', name: '默认密钥', key: settings.geminiKey }];
-      } else {
-        throw new Error('未设置 Gemini API 密钥，请在设置中添加。');
-      }
+    const candidateKeys = settings.geminiKeys && settings.geminiKeys.length > 0
+      ? settings.geminiKeys.filter(k => k.key && k.key.trim().length > 0)
+      : (settings.geminiKey && settings.geminiKey.trim().length > 0
+          ? [{ id: 'default', name: '默认密钥', key: settings.geminiKey.trim() }]
+          : []);
+
+    if (candidateKeys.length === 0) {
+      throw new Error('未设置有效的 Gemini API 密钥，请在【设置 - API配置】中添加。');
     }
     
     const geminiContents = messages.map(m => {
@@ -144,14 +306,23 @@ Your capabilities cover two main categories:
 
     let lastError: any = null;
     let success = false;
+    const attemptedKeys: { name: string; error: string }[] = [];
 
-    for (let i = 0; i < settings.geminiKeys.length; i++) {
-        const apiKey = settings.geminiKeys[i].key;
+    for (let i = 0; i < candidateKeys.length; i++) {
+        const currentKeyObj = candidateKeys[i];
+        const apiKey = currentKeyObj.key.trim();
         if (!apiKey) continue;
+
+        // If a previous key had streamed partial output before failing, clear it cleanly
+        if (fullResponse.length > 0) {
+          handleStreamChunk('', true);
+        }
         
         const ai = new GoogleGenAI({ apiKey });
+        let isThinking = false;
         
         try {
+            console.log(`[Gemini] 正在尝试密钥 "${currentKeyObj.name}" (${i + 1}/${candidateKeys.length})，模型: ${settings.geminiModel}`);
             const responseStream = await ai.models.generateContentStream({
                 model: settings.geminiModel,
                 contents: geminiContents,
@@ -164,9 +335,41 @@ Your capabilities cover two main categories:
                 if (abortSignal?.aborted) {
                   break;
                 }
-                if (chunk.text) {
-                  handleStreamChunk(chunk.text);
+
+                // Check for candidates parts to support reasoning/thinking tokens (part.thought)
+                const parts = (chunk as any).candidates?.[0]?.content?.parts;
+                if (parts && parts.length > 0) {
+                  for (const part of parts) {
+                    if (typeof part.text === 'string' && part.text) {
+                      if (part.thought) {
+                        if (!isThinking) {
+                          handleStreamChunk('<think>\n' + part.text);
+                          isThinking = true;
+                        } else {
+                          handleStreamChunk(part.text);
+                        }
+                      } else {
+                        if (isThinking) {
+                          handleStreamChunk('\n</think>\n\n' + part.text);
+                          isThinking = false;
+                        } else {
+                          handleStreamChunk(part.text);
+                        }
+                      }
+                    }
+                  }
+                } else if (chunk.text) {
+                  if (isThinking) {
+                    handleStreamChunk('\n</think>\n\n' + chunk.text);
+                    isThinking = false;
+                  } else {
+                    handleStreamChunk(chunk.text);
+                  }
                 }
+            }
+            if (isThinking) {
+              handleStreamChunk('\n</think>\n\n');
+              isThinking = false;
             }
             if (abortSignal?.aborted) {
               return;
@@ -177,33 +380,65 @@ Your capabilities cover two main categories:
             if (abortSignal?.aborted) {
               return;
             }
-            console.error(`Gemini Error with key ${settings.geminiKeys[i].name}:`, error);
-            let errMsg = error.message || '';
-            
-            try {
-                if (errMsg.includes('{')) {
-                  const parsed = JSON.parse(errMsg);
-                  if (parsed.error && parsed.error.message) errMsg = parsed.error.message;
-                }
-            } catch (e) {}
+            if (isThinking) {
+              handleStreamChunk('\n</think>\n\n');
+              isThinking = false;
+            }
+            console.error(`Gemini Error with key "${currentKeyObj.name}":`, error);
+            const parsedErr = parseApiError(error);
+            const errSummary = parsedErr.message || String(error);
+            attemptedKeys.push({ name: currentKeyObj.name, error: errSummary });
+            lastError = errSummary;
 
-            lastError = errMsg;
-            
-            if (errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('unauthorized') || errMsg.toLowerCase().includes('permissions')) {
-                console.log(`Key ${settings.geminiKeys[i].name} exhausted or invalid, trying next...`);
-                continue;
+            // 1. 判断是否属于高峰期服务繁忙/过载导致的中断。若是，直接停止并给出明确中断原因，无需轮换备用密钥
+            const busyCheck = checkServerBusyError(error, 'Gemini');
+            if (busyCheck.isBusy) {
+              console.warn(`[Gemini] 检测到高峰时刻繁忙中断，直接停止并跳过密钥轮换:`, busyCheck.reason);
+              if (fullResponse.trim().length > 0) {
+                handleStreamChunk(`\n\n*(⚠️ ${busyCheck.reason})*`);
+              }
+              throw new Error(busyCheck.reason);
+            }
+
+            // Check if model name format itself is invalid (INVALID_ARGUMENT / unexpected format)
+            const isFatalModelArgError = 
+              errSummary.includes('unexpected model name format') || 
+              (errSummary.includes('INVALID_ARGUMENT') && errSummary.toLowerCase().includes('model'));
+
+            if (isFatalModelArgError) {
+              console.warn(`[Gemini] 检测到模型名称配置错误 (${settings.geminiModel})，中断轮换。`);
+              break;
+            }
+
+            // Always try the next key in the pool if available (handles 429, 401, 403, 500, network error, etc.)
+            if (i < candidateKeys.length - 1) {
+              console.warn(
+                `[Gemini] 密钥 "${currentKeyObj.name}" 调用失败 (${errSummary})，正在自动轮换尝试下一个密钥 "${candidateKeys[i + 1].name}" (${i + 2}/${candidateKeys.length})...`
+              );
+              continue;
             } else {
-                break;
+              console.warn(`[Gemini] 所有 ${candidateKeys.length} 个可用密钥均已尝试完毕，均未成功。`);
+              break;
             }
         }
     }
 
     if (!success) {
-        let finalErrorMsg = lastError || 'Error communicating with Gemini API';
+        let finalErrorMsg = lastError || '与 Gemini API 通信时发生错误';
         if (finalErrorMsg.includes('unexpected model name format') || finalErrorMsg.includes('INVALID_ARGUMENT')) {
-            finalErrorMsg = `模型名称格式错误 (${settings.geminiModel})。请在设置中使用标准的API标识符，例如：gemini-2.5-flash`;
-        } else if (settings.geminiKeys.length > 1) {
-            finalErrorMsg = `所有可用的 Gemini 密钥均已尝试并失败。最后一次错误：${finalErrorMsg}`;
+            finalErrorMsg = `模型名称格式错误 (${settings.geminiModel})。请在【设置 - API配置】中使用标准的 API 标识符，例如：gemini-2.5-flash 或 gemini-2.0-flash`;
+        } else if (candidateKeys.length > 1) {
+            const attemptedNames = attemptedKeys.map(k => `"${k.name}"`).join('、');
+            finalErrorMsg = `所有可用的 ${candidateKeys.length} 个 Gemini 密钥（${attemptedNames}）均已尝试并失败。\n最后一次错误：${finalErrorMsg}`;
+            if (finalErrorMsg.includes('503') || finalErrorMsg.includes('high demand') || finalErrorMsg.includes('UNAVAILABLE')) {
+              finalErrorMsg += `\n\n💡 提示：Gemini 官方服务当前正经历高负载高峰（503 UNAVAILABLE）。通常短时间内会恢复，您也可以在【设置 - API配置】中切换模型（如 gemini-2.5-flash / gemini-2.0-flash）或稍后重试。`;
+            }
+        } else {
+            if (finalErrorMsg.includes('503') || finalErrorMsg.includes('high demand') || finalErrorMsg.includes('UNAVAILABLE')) {
+              finalErrorMsg = `Gemini API 调用失败（503 UNAVAILABLE）：模型当前正经历请求高峰。\n💡 建议：可稍后重试，或在【设置 - API配置】中添加备用密钥 / 切换其他模型。`;
+            } else {
+              finalErrorMsg = `Gemini API 调用失败 [${candidateKeys[0]?.name || '默认密钥'}]：${finalErrorMsg}`;
+            }
         }
         throw new Error(finalErrorMsg);
     }
@@ -301,10 +536,16 @@ Your capabilities cover two main categories:
 
     let lastError: any = null;
     let success = false;
+    const attemptedKeys: { name: string; error: string }[] = [];
 
     for (let i = 0; i < keysList.length; i++) {
-      const apiKey = keysList[i].key;
+      const currentKeyObj = keysList[i];
+      const apiKey = currentKeyObj.key.trim();
       if (!apiKey) continue;
+
+      if (fullResponse.length > 0) {
+        handleStreamChunk('', true);
+      }
 
       try {
         const requestPayload: any = {
@@ -337,7 +578,10 @@ Your capabilities cover two main categories:
           } catch {
             errDetail = await res.text();
           }
-          throw new Error(`${isDeepSeek ? 'DeepSeek' : 'OpenAI'} API 错误 (${res.status}): ${errDetail}`);
+          const httpErr: any = new Error(`${isDeepSeek ? 'DeepSeek' : 'OpenAI'} API 错误 (${res.status}): ${errDetail}`);
+          httpErr.status = res.status;
+          httpErr.code = res.status;
+          throw httpErr;
         }
 
         const reader = res.body?.getReader();
@@ -499,15 +743,24 @@ Your capabilities cover two main categories:
         if (abortSignal?.aborted || error?.name === 'AbortError' || error?.message?.includes('aborted')) {
           return;
         }
-        console.error(`${isDeepSeek ? 'DeepSeek' : 'OpenAI'} Error with key ${keysList[i].name}:`, error);
-        lastError = error.message || '网络连接或请求超时';
+        console.error(`${isDeepSeek ? 'DeepSeek' : 'OpenAI'} Error with key "${currentKeyObj.name}":`, error);
+        const parsedErr = parseApiError(error);
+        const errSummary = parsedErr.message || '网络连接或请求超时';
+        attemptedKeys.push({ name: currentKeyObj.name, error: errSummary });
+        lastError = errSummary;
 
-        // Check if retryable error (rate limit, quota, or invalid key with more keys available)
-        const isQuotaOrAuth = lastError.includes('429') || lastError.includes('quota') || 
-                              lastError.includes('401') || lastError.includes('Insufficient Balance') || 
-                              lastError.includes('insufficient_quota') || lastError.includes('402');
-        if (isQuotaOrAuth && keysList.length > 1 && i < keysList.length - 1) {
-          console.log(`Key ${keysList[i].name} failed, trying next key...`);
+        // 1. 判断是否属于高峰期服务繁忙/过载导致的中断。若是，直接停止并给出明确中断原因，无需轮换备用密钥
+        const busyCheck = checkServerBusyError(error, isDeepSeek ? 'DeepSeek' : 'OpenAI');
+        if (busyCheck.isBusy) {
+          console.warn(`[${isDeepSeek ? 'DeepSeek' : 'OpenAI'}] 检测到高峰时刻繁忙中断，直接停止并跳过密钥轮换:`, busyCheck.reason);
+          if (fullResponse.trim().length > 0) {
+            handleStreamChunk(`\n\n*(⚠️ ${busyCheck.reason})*`);
+          }
+          throw new Error(busyCheck.reason);
+        }
+
+        if (i < keysList.length - 1) {
+          console.warn(`[${isDeepSeek ? 'DeepSeek' : 'OpenAI'}] 密钥 "${currentKeyObj.name}" 调用失败 (${errSummary})，正在自动轮换尝试下一个密钥 "${keysList[i + 1].name}" (${i + 2}/${keysList.length})...`);
           continue;
         } else {
           break;
@@ -516,7 +769,12 @@ Your capabilities cover two main categories:
     }
 
     if (!success) {
-      throw new Error(lastError || `调用 ${isDeepSeek ? 'DeepSeek' : 'OpenAI'} 接口失败，请检查密钥与网络设置。`);
+      let finalErrorMsg = lastError || `调用 ${isDeepSeek ? 'DeepSeek' : 'OpenAI'} 接口失败，请检查密钥与网络设置。`;
+      if (keysList.length > 1) {
+        const attemptedNames = attemptedKeys.map(k => `"${k.name}"`).join('、');
+        finalErrorMsg = `所有可用的 ${keysList.length} 个 ${isDeepSeek ? 'DeepSeek' : 'OpenAI'} 密钥（${attemptedNames}）均已尝试并失败。\n最后一次错误：${finalErrorMsg}`;
+      }
+      throw new Error(finalErrorMsg);
     }
   }
 
