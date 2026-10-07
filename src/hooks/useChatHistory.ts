@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ChatMessage } from '../services/ai';
-import { get, set as idbSet } from 'idb-keyval';
+import { get, set as idbSet, del } from 'idb-keyval';
 
 export interface ChatSession {
   id: string;
@@ -58,6 +58,9 @@ export function useChatHistory(activeModule: 'CAD' | 'OFFICE' = 'CAD') {
   
   const [fileHandle, setFileHandle] = useState<FileSystemFileHandle | null>(null);
   const [handleNeedsPermission, setHandleNeedsPermission] = useState(false);
+  const [lastSyncTime, setLastSyncTime] = useState<number | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'saving' | 'error' | 'disconnected' | 'needs_permission'>('disconnected');
 
   // Background load from file handle
   useEffect(() => {
@@ -65,16 +68,17 @@ export function useChatHistory(activeModule: 'CAD' | 'OFFICE' = 'CAD') {
       try {
         const handle = await get<any>(FILE_HANDLE_KEY);
         if (handle) {
+          setFileHandle(handle);
           const permission = await handle.queryPermission({ mode: 'readwrite' });
           if (permission === 'granted') {
             const file = await handle.getFile();
             const text = await file.text();
             if (text) {
               const data = JSON.parse(text);
-              if (Array.isArray(data)) {
-                
+              const rawList = Array.isArray(data) ? data : (data.sessions || []);
+              if (Array.isArray(rawList)) {
                 // Sort by order first, then fallback to updatedAt
-                data.sort((a, b) => {
+                rawList.sort((a, b) => {
                   if (a.isPinned !== b.isPinned) {
                     return a.isPinned ? -1 : 1;
                   }
@@ -84,14 +88,17 @@ export function useChatHistory(activeModule: 'CAD' | 'OFFICE' = 'CAD') {
                   return b.updatedAt - a.updatedAt;
                 });
                 
-                const sanitizedData = sanitizeSessions(data);
+                const sanitizedData = sanitizeSessions(rawList);
                 setSessions(sanitizedData);
                 await idbSet(STORAGE_KEY, sanitizedData); // update local backup
               }
             }
-            setFileHandle(handle);
+            setHandleNeedsPermission(false);
+            setLastSyncTime(Date.now());
+            setSyncStatus('synced');
           } else {
             setHandleNeedsPermission(true);
+            setSyncStatus('needs_permission');
             // Fallback to load from indexedDB
             const stored = await get<ChatSession[]>(STORAGE_KEY);
             if (stored && stored.length > 0) {
@@ -157,77 +164,40 @@ export function useChatHistory(activeModule: 'CAD' | 'OFFICE' = 'CAD') {
     setCurrentSessionId(initialSession.id);
   };
 
-  const reconnectFile = async () => {
-    try {
-      const handle = await get<any>(FILE_HANDLE_KEY);
-      if (handle) {
-        const perm = await handle.requestPermission({ mode: 'readwrite' });
-        if (perm === 'granted') {
-          const file = await handle.getFile();
-          const text = await file.text();
-          if (text) {
-             const data = JSON.parse(text);
-             if (Array.isArray(data)) {
-               data.sort((a, b) => {
-                  if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
-                  if (a.order !== b.order && a.order !== undefined && b.order !== undefined) return a.order - b.order;
-                  return b.updatedAt - a.updatedAt;
-               });
-               setSessions(data);
-               await idbSet(STORAGE_KEY, data);
-             }
-          }
-          setFileHandle(handle);
-          setHandleNeedsPermission(false);
-          alert('恢复聊天数据连接成功');
-        }
-      }
-    } catch (err) {
-      console.error("恢复连接失败", err);
-      alert('恢复连接失败');
-    }
-  };
-  
-  const setupFileConnection = async () => {
-    try {
-      if ('showSaveFilePicker' in window) {
-        const handle = await (window as any).showSaveFilePicker({
-          suggestedName: `autocad_ai_chat_data.json`,
-          types: [{
-            description: 'JSON File',
-            accept: { 'application/json': ['.json'] },
-          }],
-        });
-        
-        // Write current setting to it first
-        const writable = await handle.createWritable();
-        await writable.write(JSON.stringify(sessions, null, 2));
-        await writable.close();
-        
-        await idbSet(FILE_HANDLE_KEY, handle);
-        setFileHandle(handle);
-        alert('聊天数据已保存并建立热连接');
-      } else {
-        alert('您的浏览器不支持 File System Access API');
-      }
-    } catch (err: any) {
-      if (err.name !== 'AbortError') {
-        console.error("File connection setup failed", err);
-        alert('建立连接失败');
-      }
-    }
-  };
+  const isWritingRef = useRef(false);
+  const pendingDataRef = useRef<ChatSession[] | null>(null);
 
   const saveToDisk = useCallback(async (data: ChatSession[], handle: FileSystemFileHandle | null) => {
     if (!handle) return;
+    if (isWritingRef.current) {
+      pendingDataRef.current = data;
+      return;
+    }
+    isWritingRef.current = true;
+    setIsSyncing(true);
     try {
-      if ((await (handle as any).queryPermission({ mode: 'readwrite' })) === 'granted') {
+      const perm = await (handle as any).queryPermission({ mode: 'readwrite' });
+      if (perm === 'granted') {
         const writable = await (handle as any).createWritable();
         await writable.write(JSON.stringify(data, null, 2));
         await writable.close();
+        setLastSyncTime(Date.now());
+        setSyncStatus('synced');
+      } else {
+        setHandleNeedsPermission(true);
+        setSyncStatus('needs_permission');
       }
     } catch (err) {
       console.error("Failed to write to file handle", err);
+      setSyncStatus('error');
+    } finally {
+      isWritingRef.current = false;
+      setIsSyncing(false);
+      if (pendingDataRef.current) {
+        const nextData = pendingDataRef.current;
+        pendingDataRef.current = null;
+        saveToDisk(nextData, handle);
+      }
     }
   }, []);
 
@@ -239,6 +209,280 @@ export function useChatHistory(activeModule: 'CAD' | 'OFFICE' = 'CAD') {
       saveToDisk(newSessions, fileHandle);
     }
   }, [fileHandle, saveToDisk]);
+
+  const reconnectFile = async (): Promise<boolean> => {
+    try {
+      const handle = await get<any>(FILE_HANDLE_KEY);
+      if (handle) {
+        const perm = await handle.requestPermission({ mode: 'readwrite' });
+        if (perm === 'granted') {
+          const file = await handle.getFile();
+          const text = await file.text();
+          if (text) {
+             const data = JSON.parse(text);
+             const rawList = Array.isArray(data) ? data : (data.sessions || []);
+             if (Array.isArray(rawList)) {
+               rawList.sort((a, b) => {
+                  if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+                  if (a.order !== b.order && a.order !== undefined && b.order !== undefined) return a.order - b.order;
+                  return b.updatedAt - a.updatedAt;
+               });
+               const sanitized = sanitizeSessions(rawList);
+               setSessions(sanitized);
+               await idbSet(STORAGE_KEY, sanitized);
+             }
+          }
+          setFileHandle(handle);
+          setHandleNeedsPermission(false);
+          setLastSyncTime(Date.now());
+          setSyncStatus('synced');
+          return true;
+        }
+      }
+      return false;
+    } catch (err) {
+      console.error("恢复连接失败", err);
+      return false;
+    }
+  };
+
+  // Export current chat history to a file and establish persistent sync
+  const exportChatFile = async (): Promise<{ success: boolean; message?: string }> => {
+    try {
+      if ('showSaveFilePicker' in window) {
+        const handle = await (window as any).showSaveFilePicker({
+          suggestedName: `autocad_ai_chat_data.json`,
+          types: [{
+            description: 'JSON 聊天记录 (*.json)',
+            accept: { 'application/json': ['.json'] },
+          }],
+        });
+        
+        // Write current sessions to it first
+        const writable = await handle.createWritable();
+        await writable.write(JSON.stringify(sessions, null, 2));
+        await writable.close();
+        
+        // Save handle for persistent sync
+        await idbSet(FILE_HANDLE_KEY, handle);
+        setFileHandle(handle);
+        setHandleNeedsPermission(false);
+        setLastSyncTime(Date.now());
+        setSyncStatus('synced');
+        return {
+          success: true,
+          message: `已导出 ${sessions.length} 个会话至【${handle.name}】并建立持久热同步！后续所有聊天更新都将实时同步到此文件。`
+        };
+      } else {
+        // Fallback for browsers without File System Access API
+        const blob = new Blob([JSON.stringify(sessions, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `autocad_ai_chat_data_${new Date().toISOString().slice(0, 10)}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        return {
+          success: true,
+          message: '当前浏览器不支持本地持久文件句柄，已通过下载完成导出。'
+        };
+      }
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        return { success: false, message: '用户已取消导出' };
+      }
+      console.error("File export failed", err);
+      return { success: false, message: `导出失败: ${err.message || '未知错误'}` };
+    }
+  };
+
+  // Import chat history from a file and establish persistent sync
+  const importChatFile = async (fallbackFile?: File, preferredMode?: 'replace' | 'merge'): Promise<{ success: boolean; message?: string; count?: number }> => {
+    try {
+      let fileText = '';
+      let handle: FileSystemFileHandle | null = null;
+      let fileName = '';
+
+      if (fallbackFile) {
+        fileText = await fallbackFile.text();
+        fileName = fallbackFile.name;
+      } else if ('showOpenFilePicker' in window) {
+        const [pickedHandle] = await (window as any).showOpenFilePicker({
+          types: [{
+            description: 'JSON 聊天记录 (*.json)',
+            accept: { 'application/json': ['.json'] },
+          }],
+        });
+        handle = pickedHandle;
+        fileName = pickedHandle.name;
+
+        // Ensure readwrite permission
+        let perm = await (pickedHandle as any).queryPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          perm = await (pickedHandle as any).requestPermission({ mode: 'readwrite' });
+        }
+
+        const file = await pickedHandle.getFile();
+        fileText = await file.text();
+      } else {
+        throw new Error('当前浏览器不支持文件选择器，请使用文件上传模式');
+      }
+
+      if (!fileText.trim()) {
+        throw new Error('选中的文件为空');
+      }
+
+      let parsedData: any;
+      try {
+        parsedData = JSON.parse(fileText);
+      } catch {
+        throw new Error('文件不是合法的 JSON 格式');
+      }
+
+      let rawList: any[] = [];
+      if (Array.isArray(parsedData)) {
+        rawList = parsedData;
+      } else if (parsedData && Array.isArray(parsedData.sessions)) {
+        rawList = parsedData.sessions;
+      } else if (parsedData && Array.isArray(parsedData.chatHistory)) {
+        rawList = parsedData.chatHistory;
+      } else if (parsedData && parsedData.id && parsedData.messages) {
+        rawList = [parsedData];
+      } else {
+        throw new Error('未能识别到有效的聊天记录格式');
+      }
+
+      const importedSessions = sanitizeSessions(rawList.map((item, idx) => ({
+        id: item.id || crypto.randomUUID(),
+        title: item.title || '导入会话',
+        messages: Array.isArray(item.messages) ? item.messages : [],
+        updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.now(),
+        isPinned: Boolean(item.isPinned),
+        isArchived: Boolean(item.isArchived),
+        order: typeof item.order === 'number' ? item.order : idx,
+        module: item.module === 'OFFICE' ? 'OFFICE' : 'CAD',
+      })));
+
+      if (importedSessions.length === 0) {
+        throw new Error('文件中没有有效的聊天会话');
+      }
+
+      // Check current sessions to decide merge vs replace
+      const currentValidSessions = sessions.filter(s => s.messages && s.messages.length > 0);
+      let finalMode = preferredMode;
+      if (!finalMode) {
+        if (currentValidSessions.length === 0) {
+          finalMode = 'replace';
+        } else {
+          const replace = window.confirm(
+            `检测到当前已有 ${currentValidSessions.length} 个非空会话：\n\n` +
+            `【确定】：替换当前记录（仅载入导入文件中的 ${importedSessions.length} 个会话）\n` +
+            `【取消】：合并导入（将导入的会话与现有会话合并保留）`
+          );
+          finalMode = replace ? 'replace' : 'merge';
+        }
+      }
+
+      let mergedSessions: ChatSession[] = [];
+      if (finalMode === 'replace') {
+        mergedSessions = importedSessions;
+      } else {
+        const importedMap = new Map(importedSessions.map(s => [s.id, s]));
+        const existingMerged = sessions.map(s => importedMap.has(s.id) ? importedMap.get(s.id)! : s);
+        const existingIds = new Set(sessions.map(s => s.id));
+        const newSessionsFromImport = importedSessions.filter(s => !existingIds.has(s.id));
+        mergedSessions = [...newSessionsFromImport, ...existingMerged];
+      }
+
+      mergedSessions.sort((a, b) => {
+        if (a.isPinned !== b.isPinned) return a.isPinned ? -1 : 1;
+        if (a.order !== b.order && a.order !== undefined && b.order !== undefined) return a.order - b.order;
+        return b.updatedAt - a.updatedAt;
+      });
+
+      setSessions(mergedSessions);
+      await idbSet(STORAGE_KEY, mergedSessions);
+
+      if (handle) {
+        await idbSet(FILE_HANDLE_KEY, handle);
+        setFileHandle(handle);
+        const perm = await (handle as any).queryPermission({ mode: 'readwrite' });
+        setHandleNeedsPermission(perm !== 'granted');
+        setLastSyncTime(Date.now());
+        setSyncStatus('synced');
+
+        // If user chose merge and permission is granted, persist merged content back to the file
+        if (finalMode === 'merge' && perm === 'granted') {
+          await saveToDisk(mergedSessions, handle);
+        }
+      }
+
+      // Update currentSessionId if lost
+      if (!mergedSessions.some(s => s.id === currentSessionId)) {
+        const firstActive = mergedSessions.find(s => !s.isArchived && (s.module || 'CAD') === activeModule) || mergedSessions[0];
+        if (firstActive) {
+          setCurrentSessionId(firstActive.id);
+        }
+      }
+
+      return {
+        success: true,
+        count: importedSessions.length,
+        message: handle 
+          ? `成功导入 ${importedSessions.length} 个会话，并与【${fileName}】建立了持久热同步！后续所有聊天更新将实时同步至此文件。`
+          : `成功导入 ${importedSessions.length} 个会话（数据已保存在本地数据库中）。`
+      };
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        return { success: false, message: '用户已取消导入' };
+      }
+      console.error("Import chat file failed", err);
+      return { success: false, message: err.message || '导入失败，请检查文件格式' };
+    }
+  };
+
+  // Disconnect file sync
+  const disconnectFile = useCallback(async () => {
+    try {
+      await del(FILE_HANDLE_KEY);
+      setFileHandle(null);
+      setHandleNeedsPermission(false);
+      setLastSyncTime(null);
+      setSyncStatus('disconnected');
+      return true;
+    } catch (err) {
+      console.error("Disconnect file failed", err);
+      return false;
+    }
+  }, []);
+
+  // Trigger manual sync immediately
+  const manualSync = useCallback(async () => {
+    if (!fileHandle) {
+      alert('未关联同步文件，请先通过【导入】或【导出】建立同步连接。');
+      return false;
+    }
+    try {
+      let perm = await (fileHandle as any).queryPermission({ mode: 'readwrite' });
+      if (perm !== 'granted') {
+        perm = await (fileHandle as any).requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted') {
+          setHandleNeedsPermission(true);
+          setSyncStatus('needs_permission');
+          alert('未获得该文件的写入权限');
+          return false;
+        }
+      }
+      setHandleNeedsPermission(false);
+      await saveToDisk(sessions, fileHandle);
+      alert(`已成功将当前所有聊天记录立即同步保存至【${fileHandle.name}】！`);
+      return true;
+    } catch (err: any) {
+      console.error("Manual sync failed", err);
+      alert(`同步失败: ${err.message || '未知错误'}`);
+      return false;
+    }
+  }, [fileHandle, saveToDisk, sessions]);
 
   const saveSessions = useCallback(async (newSessions: ChatSession[]) => {
     saveAndSync(newSessions);
@@ -384,9 +628,19 @@ export function useChatHistory(activeModule: 'CAD' | 'OFFICE' = 'CAD') {
     reorderSessions,
     saveSessions,
     fileHandleName: fileHandle?.name,
+    fileHandle,
     handleNeedsPermission,
+    lastSyncTime,
+    isSyncing,
+    syncStatus,
     reconnectFile,
-    setupFileConnection
+    exportChatFile,
+    importChatFile,
+    exportChatHistory: exportChatFile,
+    importChatHistory: importChatFile,
+    disconnectFile,
+    manualSync,
+    setupFileConnection: exportChatFile
   };
 }
 
